@@ -24,12 +24,28 @@ contract LiquidityPool is ReentrancyGuard {
 
     event LiquidityWithdrawn(address indexed user, uint256 amount);
 
+    address public immutable owner;
+    address public lendingController;
+
+    uint256 public totalBorrowed;
+
+    error Unauthorized();
+    error InvalidController();
+    error ControllerAlreadySet();
+    error InsufficientLiquidity();
+
+    event LendingControllerSet(address indexed controller);
+
+    event LoanDisbursed(address indexed borrower, uint256 amount);
+
     constructor(address asset_) {
         if (asset_ == address(0) || asset_.code.length == 0) {
             revert InvalidAsset();
         }
 
         asset = IERC20(asset_);
+
+        owner = msg.sender; // Añade esta línea si falta
     }
 
     function deposit(uint256 amount) external nonReentrant {
@@ -80,5 +96,57 @@ contract LiquidityPool is ReentrancyGuard {
 
     function availableLiquidity() external view returns (uint256) {
         return asset.balanceOf(address(this));
+    }
+
+    // El deployer autoriza un unico contrato de Lending.
+    function setLendingController(address controller_) external {
+        if (msg.sender != owner) {
+            revert Unauthorized();
+        }
+
+        if (lendingController != address(0)) {
+            revert ControllerAlreadySet();
+        }
+
+        if (controller_ == address(0) || controller_.code.length == 0) {
+            revert InvalidController();
+        }
+
+        lendingController = controller_;
+
+        emit LendingControllerSet(controller_);
+    }
+
+    // Solo LendingProtocol puede ordenar prestamos.
+    function lendTo(address borrower, uint256 amount) external nonReentrant {
+        if (msg.sender != lendingController) {
+            revert Unauthorized();
+        }
+
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
+
+        if (borrower == address(0)) {
+            revert InvalidController();
+        }
+
+        uint256 beforeBalance = asset.balanceOf(address(this));
+
+        if (beforeBalance < amount) {
+            revert InsufficientLiquidity();
+        }
+
+        totalBorrowed += amount;
+
+        asset.safeTransfer(borrower, amount);
+
+        uint256 afterBalance = asset.balanceOf(address(this));
+
+        if (afterBalance > beforeBalance || beforeBalance - afterBalance != amount) {
+            revert UnsupportedToken();
+        }
+
+        emit LoanDisbursed(borrower, amount);
     }
 }
