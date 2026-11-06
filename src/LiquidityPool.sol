@@ -38,6 +38,8 @@ contract LiquidityPool is ReentrancyGuard {
 
     event LoanDisbursed(address indexed borrower, uint256 amount);
 
+    event LoanRepaid(address indexed payer, uint256 amount);
+
     constructor(address asset_) {
         if (asset_ == address(0) || asset_.code.length == 0) {
             revert InvalidAsset();
@@ -148,5 +150,38 @@ contract LiquidityPool is ReentrancyGuard {
         }
 
         emit LoanDisbursed(borrower, amount);
+    }
+
+    // Recibir USDC para devolver un prestamo.
+    // Solo LendingProtocol puede solicitar la operacion.
+    function repayFrom(address payer, uint256 amount) external nonReentrant {
+        if (msg.sender != lendingController) {
+            revert Unauthorized();
+        }
+
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
+
+        if (amount > totalBorrowed) {
+            revert InsufficientDeposit();
+        }
+
+        // Reducimos el principal pendiente.
+        totalBorrowed -= amount;
+
+        uint256 balanceBefore = asset.balanceOf(address(this));
+
+        // El pool recoge los USDC del prestatario.
+        asset.safeTransferFrom(payer, address(this), amount);
+
+        uint256 balanceAfter = asset.balanceOf(address(this));
+
+        // Deben haberse recibido exactamente los USDC.
+        if (balanceAfter < balanceBefore || balanceAfter - balanceBefore != amount) {
+            revert UnsupportedToken();
+        }
+
+        emit LoanRepaid(payer, amount);
     }
 }

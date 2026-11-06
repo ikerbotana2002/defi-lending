@@ -9,8 +9,9 @@ import {LiquidityPool} from "./LiquidityPool.sol";
 import {CollateralVault} from "./CollateralVault.sol";
 import {ICollateralController} from "./interfaces/ICollateralController.sol";
 import {IPriceOracle} from "./interfaces/IPriceOracle.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-contract LendingProtocol is ICollateralController {
+contract LendingProtocol is ICollateralController, ReentrancyGuard {
     uint256 public constant WAD = 1e18;
     uint256 public constant USDC_SCALE = 1e12;
     uint256 public constant BPS = 10_000;
@@ -28,6 +29,11 @@ contract LendingProtocol is ICollateralController {
     error ControllersNotConfigured();
     error ZeroAmount();
     error InsufficientCollateral();
+
+    error NoDebt();
+    error RepaymentExceedsDebt();
+
+    event Repaid(address indexed borrower, uint256 amount, uint256 remainingDebt);
 
     event Borrowed(address indexed borrower, uint256 amount);
 
@@ -69,7 +75,7 @@ contract LendingProtocol is ICollateralController {
         return Math.mulDiv(valueUsd18, MAX_LTV_BPS, BPS * USDC_SCALE);
     }
 
-    function borrow(uint256 amount) external {
+    function borrow(uint256 amount) external nonReentrant {
         if (amount == 0) {
             revert ZeroAmount();
         }
@@ -94,6 +100,34 @@ contract LendingProtocol is ICollateralController {
         pool.lendTo(msg.sender, amount);
 
         emit Borrowed(msg.sender, amount);
+    }
+
+    // Devolver parte o la totalidad de un prestamo.
+    function repay(uint256 amount) external nonReentrant {
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
+
+        uint256 currentDebt = debt[msg.sender];
+
+        if (currentDebt == 0) {
+            revert NoDebt();
+        }
+
+        if (amount > currentDebt) {
+            revert RepaymentExceedsDebt();
+        }
+
+        uint256 remainingDebt = currentDebt - amount;
+
+        // Actualizamos la deuda individual.
+        debt[msg.sender] = remainingDebt;
+
+        // El pool recibe los USDC y reduce
+        // su contabilidad global de prestamos.
+        pool.repayFrom(msg.sender, amount);
+
+        emit Repaid(msg.sender, amount, remainingDebt);
     }
 
     // El CollateralVault consulta esta funcion
