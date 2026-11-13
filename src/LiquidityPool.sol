@@ -14,6 +14,7 @@ contract LiquidityPool is ReentrancyGuard {
 
     mapping(address => uint256) public deposits;
     uint256 public totalDeposits;
+    uint256 public totalInterestCollected;
 
     error InvalidAsset();
     error ZeroAmount();
@@ -39,6 +40,8 @@ contract LiquidityPool is ReentrancyGuard {
     event LoanDisbursed(address indexed borrower, uint256 amount);
 
     event LoanRepaid(address indexed payer, uint256 amount);
+
+    event InterestCollected(address indexed payer, uint256 amount);
 
     constructor(address asset_) {
         if (asset_ == address(0) || asset_.code.length == 0) {
@@ -183,5 +186,29 @@ contract LiquidityPool is ReentrancyGuard {
         }
 
         emit LoanRepaid(payer, amount);
+    }
+
+    function collectInterestFrom(address payer, uint256 amount) external nonReentrant {
+        if (msg.sender != lendingController) {
+            revert Unauthorized();
+        }
+
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
+
+        uint256 balanceBefore = asset.balanceOf(address(this));
+
+        asset.safeTransferFrom(payer, address(this), amount);
+
+        uint256 balanceAfter = asset.balanceOf(address(this));
+
+        if (balanceAfter < balanceBefore || balanceAfter - balanceBefore != amount) {
+            revert UnsupportedToken();
+        }
+
+        totalInterestCollected += amount;
+
+        emit InterestCollected(payer, amount);
     }
 }
