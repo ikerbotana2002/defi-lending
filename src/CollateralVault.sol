@@ -26,12 +26,16 @@ contract CollateralVault is ReentrancyGuard {
     error InvalidController();
     error ControllerAlreadySet();
     error UnsafeWithdrawal();
+    error InvalidRecipient();
+    error ControllerNotConfigured();
 
     event CollateralDeposited(address indexed user, uint256 amount);
 
     event CollateralWithdrawn(address indexed user, uint256 amount);
 
     event RiskControllerSet(address indexed controller);
+
+    event CollateralSeized(address indexed borrower, address indexed liquidator, uint256 amount);
 
     constructor(address token_) {
         if (token_ == address(0) || token_.code.length == 0) {
@@ -121,5 +125,40 @@ contract CollateralVault is ReentrancyGuard {
 
     function getCollateralBalance(address user) external view returns (uint256) {
         return collateralBalances[user];
+    }
+
+    function seizeCollateral(address borrower, address liquidator, uint256 amount) external nonReentrant {
+        // Solo nuestro LendingProtocol puede liquidar.
+        if (address(riskController) == address(0) || msg.sender != address(riskController)) {
+            revert Unauthorized();
+        }
+
+        if (borrower == address(0) || liquidator == address(0)) {
+            revert InvalidRecipient();
+        }
+
+        if (amount == 0) {
+            revert ZeroAmount();
+        }
+
+        if (collateralBalances[borrower] < amount) {
+            revert InsufficientCollateral();
+        }
+
+        // Actualizar la contabilidad antes de transferir.
+        collateralBalances[borrower] -= amount;
+        totalCollateral -= amount;
+
+        uint256 balanceBefore = collateralToken.balanceOf(address(this));
+
+        collateralToken.safeTransfer(liquidator, amount);
+
+        uint256 balanceAfter = collateralToken.balanceOf(address(this));
+
+        if (balanceAfter > balanceBefore || balanceBefore - balanceAfter != amount) {
+            revert UnsupportedToken();
+        }
+
+        emit CollateralSeized(borrower, liquidator, amount);
     }
 }

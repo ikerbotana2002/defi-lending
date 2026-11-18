@@ -20,6 +20,15 @@ contract LendingProtocol is ICollateralController, ReentrancyGuard {
     uint256 public constant BORROW_APR_BPS = 1_000;
     uint256 public constant YEAR = 365 days;
 
+    // Umbral de liquidacion: 60%.
+    uint256 public constant LIQUIDATION_THRESHOLD_BPS = 6_000;
+
+    // Bonificacion del liquidador: 5%.
+    uint256 public constant LIQUIDATION_BONUS_BPS = 500;
+
+    // Maximo de deuda liquidable por operacion: 50%.
+    uint256 public constant CLOSE_FACTOR_BPS = 5_000;
+
     LiquidityPool public immutable pool;
     CollateralVault public immutable vault;
     IPriceOracle public immutable oracle;
@@ -40,6 +49,15 @@ contract LendingProtocol is ICollateralController, ReentrancyGuard {
     error InsufficientCollateral();
     error NoDebt();
     error RepaymentExceedsDebt();
+
+    error PositionHealthy();
+    error InvalidLiquidationAmount();
+    error InsufficientSeizableCollateral();
+    error InvalidBorrower();
+
+    event Liquidated(
+        address indexed borrower, address indexed liquidator, uint256 debtRepaid, uint256 collateralSeized
+    );
 
     event Borrowed(address indexed borrower, uint256 amount);
 
@@ -229,5 +247,110 @@ contract LendingProtocol is ICollateralController, ReentrancyGuard {
         uint256 maxDebtAfterWithdrawal = Math.mulDiv(remainingValueUsd18, MAX_LTV_BPS, BPS * USDC_SCALE);
 
         return getTotalDebt(user) <= maxDebtAfterWithdrawal;
+    }
+
+    // Cuanta deuda puede soportar la garantia antes
+    // de entrar en zona liquidable.
+    function getLiquidationThresholdDebt(address user) public view returns (uint256) {
+        uint256 valueUsd18 = getCollateralValueUsd18(user);
+
+        return Math.mulDiv(valueUsd18, LIQUIDATION_THRESHOLD_BPS, BPS * USDC_SCALE);
+    }
+
+    // Health Factor normalizado a 18 decimales.
+    // 1e18 representa HF = 1.
+    function getHealthFactor(address user) public view returns (uint256) {
+        uint256 totalOwed = getTotalDebt(user);
+
+        // Sin deuda, no existe riesgo de liquidacion.
+        if (totalOwed == 0) {
+            return type(uint256).max;
+        }
+
+        uint256 thresholdDebt = getLiquidationThresholdDebt(user);
+
+        return Math.mulDiv(thresholdDebt, WAD, totalOwed);
+    }
+
+    // Una posicion es liquidable cuando HF < 1.
+    function isLiquidatable(address user) public view returns (bool) {
+        return getHealthFactor(user) < WAD;
+    }
+
+    // Convierte los USDC devueltos a WETH,
+    // incluyendo la bonificacion del 5%.
+    function getCollateralToSeize(uint256 repayAmount) public view returns (uint256) {
+        if (repayAmount == 0) {
+            revert ZeroAmount();
+        }
+
+        // Precio ETH/USD a 18 decimales.
+        uint256 price18 = oracle.getPrice18();
+
+        // 1e30 = 1e12 para pasar USDC a USD18,
+        // multiplicado por 1e18 para obtener WETH wei.
+        uint256 baseCollateralWei = Math.mulDiv(repayAmount, 1e30, price18);
+
+        return Math.mulDiv(baseCollateralWei, BPS + LIQUIDATION_BONUS_BPS, BPS);
+    }
+
+    function liquidate(address borrower, uint256 repayAmount) external nonReentrant {
+        if (borrower == address(0) || borrower == msg.sender) {
+            revert InvalidBorrower();
+        }
+
+        if (repayAmount == 0) {
+            revert ZeroAmount();
+        }
+
+        // 1. Comprobar que la posicion es liquidable.
+        if (!isLiquidatable(borrower)) {
+            revert PositionHealthy();
+        }
+
+        // 2. Actualizar los intereses pendientes.
+        _accrue(borrower);
+
+        uint256 principal = debt[borrower];
+        uint256 interest = storedInterest[borrower];
+        uint256 totalOwed = principal + interest;
+
+        // 3. Maximo 50% de la deuda en esta operacion.
+        uint256 maxRepayment = Math.mulDiv(totalOwed, CLOSE_FACTOR_BPS, BPS, Math.Rounding.Ceil);
+
+        if (repayAmount > maxRepayment) {
+            revert InvalidLiquidationAmount();
+        }
+
+        // 4. Calcular los WETH que recibira el liquidador.
+        uint256 collateralAmount = getCollateralToSeize(repayAmount);
+
+        if (collateralAmount == 0 || collateralAmount > vault.collateralBalances(borrower)) {
+            revert InsufficientSeizableCollateral();
+        }
+
+        // 5. Primero se pagan los intereses.
+        uint256 interestPaid = Math.min(repayAmount, interest);
+
+        uint256 principalPaid = repayAmount - interestPaid;
+
+        storedInterest[borrower] = interest - interestPaid;
+
+        debt[borrower] = principal - principalPaid;
+
+        // 6. El pool recibe USDC del LIQUIDADOR,
+        // no del prestatario.
+        if (interestPaid > 0) {
+            pool.collectInterestFrom(msg.sender, interestPaid);
+        }
+
+        if (principalPaid > 0) {
+            pool.repayFrom(msg.sender, principalPaid);
+        }
+
+        // 7. El Vault entrega WETH al liquidador.
+        vault.seizeCollateral(borrower, msg.sender, collateralAmount);
+
+        emit Liquidated(borrower, msg.sender, repayAmount, collateralAmount);
     }
 }
